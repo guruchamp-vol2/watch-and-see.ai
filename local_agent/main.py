@@ -2,11 +2,14 @@ import json
 import os
 import tempfile
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import requests
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from faster_whisper import WhisperModel
@@ -14,24 +17,56 @@ from faster_whisper import WhisperModel
 APP_HOST = "127.0.0.1"
 APP_PORT = 8000
 
-WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "base")  # base is fast; try "small" or "large-v3" later
+# Whisper settings
+WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "base")  # base = fast; try "small" or "large-v3" later
 DEVICE = os.environ.get("WHISPER_DEVICE", "cpu")
 COMPUTE_TYPE = os.environ.get("WHISPER_COMPUTE", "int8")
 
+# Ollama settings
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.1:8b")
 
-app = FastAPI(title="Watch & See Local Agent")
+# Web UI directory (served by local agent)
+WEB_DIR = Path(__file__).parent / "web"
+if not WEB_DIR.exists():
+    # Helpful error if user forgot to copy frontend into local_agent/web
+    WEB_DIR.mkdir(parents=True, exist_ok=True)
 
+app = FastAPI(title="Watch & See Local App")
+
+# CORS: safe because this app is local-only usage
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # the web app may be hosted anywhere
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Load whisper once
+# Serve static UI
+# You can access the UI at:
+#   http://127.0.0.1:8000/
+# Static assets also available under /web/*
+app.mount("/web", StaticFiles(directory=str(WEB_DIR)), name="web")
+
+
+@app.get("/")
+def serve_index():
+    index_path = WEB_DIR / "index.html"
+    return FileResponse(str(index_path))
+
+
+@app.get("/app.js")
+def serve_app_js():
+    return FileResponse(str(WEB_DIR / "app.js"))
+
+
+@app.get("/style.css")
+def serve_style_css():
+    return FileResponse(str(WEB_DIR / "style.css"))
+
+
+# Load whisper once at startup
 whisper = WhisperModel(WHISPER_MODEL, device=DEVICE, compute_type=COMPUTE_TYPE)
 
 
@@ -43,7 +78,9 @@ def ollama_ok() -> bool:
         return False
 
 
-@app.get("/health")
+# -------------------- API (namespaced under /api) -------------------- #
+
+@app.get("/api/health")
 def health():
     return {
         "ok": True,
@@ -56,17 +93,16 @@ def health():
     }
 
 
-@app.post("/transcribe")
+@app.post("/api/transcribe")
 async def transcribe(audio: UploadFile = File(...)):
     """
     Receives small audio chunks (webm/opus from browser MediaRecorder),
-    runs faster-whisper, returns plain text.
+    runs faster-whisper, returns text.
     """
     data = await audio.read()
     if not data:
         return {"text": ""}
 
-    # Write to temp file with original extension for ffmpeg decode inside whisper stack
     suffix = os.path.splitext(audio.filename or "")[1] or ".webm"
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         tmp.write(data)
@@ -168,13 +204,12 @@ Rules:
         data = r.json()
         raw = data.get("response", "").strip()
 
-        # Best-effort JSON extraction
         start = raw.find("{")
         end = raw.rfind("}")
         if start == -1 or end == -1 or end <= start:
             return None
 
-        obj = json.loads(raw[start : end + 1])
+        obj = json.loads(raw[start: end + 1])
         if "tips" not in obj:
             return None
 
@@ -184,19 +219,17 @@ Rules:
         return None
 
 
-@app.post("/coach")
+@app.post("/api/coach")
 def coach(req: CoachReq):
     snippet = (req.transcript or "").strip()
     if len(snippet) < 10:
         return {"tips": ["Start speaking and I’ll coach in real-time."], "scorecard": {}, "source": "none"}
 
-    # Try Ollama first
     if ollama_ok():
         res = call_ollama(snippet[-1200:])
         if res:
             return res
 
-    # fallback to rules
     return rule_coach(snippet[-1200:])
 
 
