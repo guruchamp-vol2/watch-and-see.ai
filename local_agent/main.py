@@ -1,5 +1,6 @@
 import json
 import os
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -17,24 +18,25 @@ from faster_whisper import WhisperModel
 APP_HOST = "127.0.0.1"
 APP_PORT = 8000
 
-# Whisper settings
-WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "base")  # base = fast; try "small" or "large-v3" later
+WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "base")
 DEVICE = os.environ.get("WHISPER_DEVICE", "cpu")
 COMPUTE_TYPE = os.environ.get("WHISPER_COMPUTE", "int8")
 
-# Ollama settings
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.1:8b")
 
-# Web UI directory (served by local agent)
-WEB_DIR = Path(__file__).parent / "web"
-if not WEB_DIR.exists():
-    # Helpful error if user forgot to copy frontend into local_agent/web
-    WEB_DIR.mkdir(parents=True, exist_ok=True)
+
+def resource_dir(relative: str) -> Path:
+    # Works in dev + PyInstaller onefile
+    base = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
+    return base / relative
+
+
+WEB_DIR = resource_dir("web")
+WEB_DIR.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI(title="Watch & See Local App")
 
-# CORS: safe because this app is local-only usage
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -43,30 +45,26 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Serve static UI
-# You can access the UI at:
-#   http://127.0.0.1:8000/
-# Static assets also available under /web/*
+# Serve UI
 app.mount("/web", StaticFiles(directory=str(WEB_DIR)), name="web")
 
 
 @app.get("/")
-def serve_index():
-    index_path = WEB_DIR / "index.html"
-    return FileResponse(str(index_path))
+def root():
+    return FileResponse(str(WEB_DIR / "index.html"))
 
 
 @app.get("/app.js")
-def serve_app_js():
+def app_js():
     return FileResponse(str(WEB_DIR / "app.js"))
 
 
 @app.get("/style.css")
-def serve_style_css():
+def style_css():
     return FileResponse(str(WEB_DIR / "style.css"))
 
 
-# Load whisper once at startup
+# Load whisper once
 whisper = WhisperModel(WHISPER_MODEL, device=DEVICE, compute_type=COMPUTE_TYPE)
 
 
@@ -77,8 +75,6 @@ def ollama_ok() -> bool:
     except Exception:
         return False
 
-
-# -------------------- API (namespaced under /api) -------------------- #
 
 @app.get("/api/health")
 def health():
@@ -95,10 +91,6 @@ def health():
 
 @app.post("/api/transcribe")
 async def transcribe(audio: UploadFile = File(...)):
-    """
-    Receives small audio chunks (webm/opus from browser MediaRecorder),
-    runs faster-whisper, returns text.
-    """
     data = await audio.read()
     if not data:
         return {"text": ""}
@@ -114,7 +106,6 @@ async def transcribe(audio: UploadFile = File(...)):
         for s in segments:
             if s.text:
                 text_parts.append(s.text.strip())
-
         text = " ".join(text_parts).strip()
         return {"text": text, "language": getattr(info, "language", None)}
     finally:
@@ -166,10 +157,6 @@ def rule_coach(text: str) -> Dict[str, Any]:
 
 
 def call_ollama(transcript: str) -> Optional[Dict[str, Any]]:
-    """
-    Uses Ollama local HTTP API. Requires `ollama serve` running.
-    Returns dict with tips + scorecard or None.
-    """
     prompt = f"""
 You are a real-time call coach (Observe-style). Based ONLY on the transcript snippet, give actionable tips.
 
@@ -209,7 +196,7 @@ Rules:
         if start == -1 or end == -1 or end <= start:
             return None
 
-        obj = json.loads(raw[start: end + 1])
+        obj = json.loads(raw[start:end + 1])
         if "tips" not in obj:
             return None
 
