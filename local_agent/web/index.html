@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Watch & See AI — Live Coach</title>
+  <link rel="stylesheet" href="./style.css"/>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <h1>Watch & See AI</h1>
+      <p class="sub">Live coaching: listens to your mic and gives real-time tips (no uploads).</p>
+    </header>
+
+    <section class="card">
+      <div class="row">
+        <label class="label">Mode</label>
+        <select id="mode">
+          <option value="browser">Browser Speech (no install)</option>
+          <option value="local">Local Whisper + Ollama (best quality)</option>
+        </select>
+        <button id="btnHealth" class="ghost">Check Local Agent</button>
+      </div>
+
+      <div class="row">
+        <button id="btnStart" class="primary">Start Listening</button>
+        <button id="btnStop" class="danger" disabled>Stop</button>
+        <span id="status" class="status">Idle</span>
+      </div>
+
+      <div class="hint">
+        <b>Tip:</b> If Browser Speech doesn’t work, switch to <b>Local Whisper + Ollama</b> and run the local agent.
+      </div>
+    </section>
+
+    <section class="grid">
+      <div class="card">
+        <h2>Live Transcript</h2>
+        <div class="small">Updates continuously while listening.</div>
+        <pre id="transcript" class="box"></pre>
+        <div class="row right">
+          <button id="btnClear" class="ghost">Clear</button>
+          <button id="btnCopy" class="ghost">Copy</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Coach Tips</h2>
+        <div class="small">Real-time suggestions based on what you said recently.</div>
+        <ul id="tips" class="tips"></ul>
+
+        <h3 class="mt">Scorecard</h3>
+        <div class="score">
+          <div><span>Clarity</span><b id="sClarity">—</b></div>
+          <div><span>Empathy</span><b id="sEmpathy">—</b></div>
+          <div><span>Next Steps</span><b id="sNext">—</b></div>
+          <div><span>Compliance</span><b id="sCompliance">—</b></div>
+        </div>
+
+        <div class="mt small">
+          <b>Local Agent URL:</b> <code id="agentUrl">http://127.0.0.1:8000</code>
+        </div>
+      </div>
+    </section>
+
+    <footer class="small">
+      Audio stays on the user’s device. No server uploads required.
+    </footer>
+  </div>
+
+  <script src="./app.js"></script>
+</body>
+</html>
