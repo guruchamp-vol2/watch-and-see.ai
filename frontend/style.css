@@ -1,0 +1,104 @@
+:root {
+  --bg: #0b0c10;
+  --card: #12141b;
+  --text: #e8eaf1;
+  --muted: #aeb3c2;
+  --border: #24283a;
+  --primary: #4f8cff;
+  --danger: #ff4f6d;
+}
+
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial;
+}
+.wrap { max-width: 1100px; margin: 0 auto; padding: 24px; }
+header { margin-bottom: 14px; }
+h1 { margin: 0 0 6px 0; font-size: 28px; }
+.sub { margin: 0; color: var(--muted); }
+
+.card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 16px;
+  margin-top: 14px;
+}
+.grid {
+  display: grid;
+  gap: 14px;
+  grid-template-columns: 1.2fr 0.8fr;
+}
+@media (max-width: 900px) {
+  .grid { grid-template-columns: 1fr; }
+}
+
+.row {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  margin-top: 10px;
+  flex-wrap: wrap;
+}
+.right { justify-content: flex-end; }
+.label { color: var(--muted); }
+select {
+  background: #0f1118;
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 10px;
+  border-radius: 10px;
+}
+button {
+  border: 1px solid var(--border);
+  background: #0f1118;
+  color: var(--text);
+  padding: 10px 12px;
+  border-radius: 10px;
+  cursor: pointer;
+}
+button:disabled { opacity: 0.5; cursor: not-allowed; }
+.primary { background: var(--primary); border-color: var(--primary); color: #07101f; font-weight: 700; }
+.danger { background: var(--danger); border-color: var(--danger); color: #1a070c; font-weight: 700; }
+.ghost { background: transparent; }
+
+.status { color: var(--muted); }
+.hint { margin-top: 10px; color: var(--muted); }
+
+.box {
+  margin-top: 12px;
+  background: #0f1118;
+  border: 1px solid var(--border);
+  padding: 12px;
+  border-radius: 12px;
+  min-height: 260px;
+  max-height: 420px;
+  overflow: auto;
+  white-space: pre-wrap;
+}
+
+.tips { margin: 12px 0 0 18px; color: var(--text); }
+.tips li { margin: 8px 0; color: var(--text); }
+.small { color: var(--muted); font-size: 13px; }
+.mt { margin-top: 14px; }
+
+.score {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  margin-top: 10px;
+}
+.score > div {
+  background: #0f1118;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 10px;
+  display: flex;
+  justify-content: space-between;
+}
+code { background: #0f1118; padding: 2px 6px; border-radius: 8px; border: 1px solid var(--border); }
+
+footer { margin-top: 18px; }

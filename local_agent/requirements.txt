@@ -1,0 +1,6 @@
+fastapi==0.131.0
+uvicorn==0.41.0
+python-multipart==0.0.22
+faster-whisper==1.2.1
+pydantic==2.12.5
+requests==2.32.3
