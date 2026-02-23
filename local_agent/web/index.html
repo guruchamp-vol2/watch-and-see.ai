@@ -2,74 +2,94 @@
 <html lang="en">
 <head>
   <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width,initial-scale=1"/>
-  <title>Watch & See AI — Live Coach</title>
-  <link rel="stylesheet" href="./style.css"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Watch & See AI</title>
+  <link rel="manifest" href="/web/manifest.webmanifest">
+  <link rel="stylesheet" href="/style.css"/>
 </head>
 <body>
-  <div class="wrap">
-    <header>
-      <h1>Watch & See AI</h1>
-      <p class="sub">Live coaching: listens to your mic and gives real-time tips (no uploads).</p>
-    </header>
-
-    <section class="card">
-      <div class="row">
-        <label class="label">Mode</label>
-        <select id="mode">
-  <option value="browser">Browser Speech (no install)</option>
-  <option value="local">Mic Whisper + Ollama (best)</option>
-  <option value="system">System Audio (Windows) — Everything Playing</option>
-</select>
-        <button id="btnHealth" class="ghost">Check Local Agent</button>
+  <div class="container">
+    <div class="header">
+      <div class="brand">
+        <h1>Watch & See AI</h1>
+        <p>Live coaching: listens locally and gives real-time tips. No uploads when using Local Agent mode.</p>
       </div>
-
-      <div class="row">
-        <button id="btnStart" class="primary">Start Listening</button>
-        <button id="btnStop" class="danger" disabled>Stop</button>
-        <span id="status" class="status">Idle</span>
+      <div class="pills" id="statusPills">
+        <span class="pill" id="pillAgent">Agent: …</span>
+        <span class="pill" id="pillOllama">Ollama: …</span>
+        <span class="pill" id="pillMode">Mode: …</span>
       </div>
+    </div>
 
-      <div class="hint">
-        <b>Tip:</b> If Browser Speech doesn’t work, switch to <b>Local Whisper + Ollama</b> and run the local agent.
-      </div>
-    </section>
-
-    <section class="grid">
+    <div class="grid">
+      <!-- Left: Controls + transcript -->
       <div class="card">
-        <h2>Live Transcript</h2>
-        <div class="small">Updates continuously while listening.</div>
-        <pre id="transcript" class="box"></pre>
-        <div class="row right">
-          <button id="btnClear" class="ghost">Clear</button>
-          <button id="btnCopy" class="ghost">Copy</button>
+        <div class="row space">
+          <h2>Listening</h2>
+          <div class="pills">
+            <span class="pill" id="pillListening">Not listening</span>
+          </div>
+        </div>
+
+        <div class="controls">
+          <div>
+            <label>Mode</label>
+            <select id="modeSelect">
+              <option value="system">System Audio (Stereo Mix)</option>
+              <option value="mic">Microphone (browser)</option>
+            </select>
+          </div>
+          <div>
+            <label>Local Agent URL</label>
+            <input id="agentUrl" value="http://127.0.0.1:8000" />
+          </div>
+        </div>
+
+        <div class="toolbar">
+          <button class="btn primary" id="btnStart">Start Listening</button>
+          <button class="btn danger" id="btnStop" disabled>Stop</button>
+          <button class="btn" id="btnDeviceDump" title="Shows your audio devices in console">Device Dump</button>
+        </div>
+
+        <hr class="sep"/>
+
+        <div class="row space">
+          <h2>Live Transcript</h2>
+          <div class="toolbar">
+            <button class="btn" id="btnClearTranscript">Clear</button>
+            <button class="btn" id="btnCopyTranscript">Copy</button>
+          </div>
+        </div>
+        <div class="box" id="transcriptBox">Updates continuously while listening.</div>
+
+        <div class="footerNote">
+          Tip: For system audio you must have <b>Stereo Mix</b> enabled in Windows Sound → Recording.
         </div>
       </div>
 
+      <!-- Right: Tips + score -->
       <div class="card">
-        <h2>Coach Tips</h2>
-        <div class="small">Real-time suggestions based on what you said recently.</div>
-        <ul id="tips" class="tips"></ul>
-
-        <h3 class="mt">Scorecard</h3>
-        <div class="score">
-          <div><span>Clarity</span><b id="sClarity">—</b></div>
-          <div><span>Empathy</span><b id="sEmpathy">—</b></div>
-          <div><span>Next Steps</span><b id="sNext">—</b></div>
-          <div><span>Compliance</span><b id="sCompliance">—</b></div>
+        <div class="row space">
+          <h2>Coach Tips</h2>
+          <span class="pill" id="pillCoach">Source: …</span>
         </div>
 
-        <div class="mt small">
-          <b>Local Agent URL:</b> <code id="agentUrl">http://127.0.0.1:8000</code>
+        <div class="box small" id="tipsBox">Click “Start Listening” to begin.</div>
+
+        <div class="kpis">
+          <div class="kpi"><div class="name">Clarity</div><div class="val" id="kClarity">—</div></div>
+          <div class="kpi"><div class="name">Empathy</div><div class="val" id="kEmpathy">—</div></div>
+          <div class="kpi"><div class="name">Next Steps</div><div class="val" id="kNext">—</div></div>
+          <div class="kpi"><div class="name">Compliance</div><div class="val" id="kComp">—</div></div>
+        </div>
+
+        <div class="footerNote">
+          Everything runs on your device. The only “network call” is to your local agent + (optional) Ollama on localhost.
         </div>
       </div>
-    </section>
-
-    <footer class="small">
-      Audio stays on the user’s device. No server uploads required.
-    </footer>
+    </div>
   </div>
 
-  <script src="./app.js"></script>
+  <script src="/app.js"></script>
 </body>
 </html>

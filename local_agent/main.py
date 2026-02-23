@@ -12,41 +12,64 @@ from typing import Any, Deque, Dict, List, Optional
 import numpy as np
 import requests
 import sounddevice as sd
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+
 from faster_whisper import WhisperModel
 
-APP_HOST = "127.0.0.1"
-APP_PORT = 8000
 
-# ------------------ Settings ------------------ #
-WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "base")   # base=fast
-DEVICE = os.environ.get("WHISPER_DEVICE", "cpu")
-COMPUTE_TYPE = os.environ.get("WHISPER_COMPUTE", "int8")
+# -------------------------------------------------
+# App config
+# -------------------------------------------------
 
+APP_HOST = os.environ.get("APP_HOST", "127.0.0.1")
+APP_PORT = int(os.environ.get("APP_PORT", "8000"))
+
+# Whisper
+# "base" is fast. "small" is noticeably more accurate on many voices.
+WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "small")
+WHISPER_DEVICE = os.environ.get("WHISPER_DEVICE", "cpu")
+WHISPER_COMPUTE = os.environ.get("WHISPER_COMPUTE", "int8")
+
+# Whisper inference tuning (accuracy vs speed)
+# If CPU struggles, set WHISPER_BEAM=1 and WHISPER_BEST_OF=1
+WHISPER_BEAM = int(os.environ.get("WHISPER_BEAM", "2"))
+WHISPER_BEST_OF = int(os.environ.get("WHISPER_BEST_OF", "2"))
+
+# Target SR for Whisper
+WHISPER_SR = 16000
+
+# System audio cadence
+# We transcribe a *window* of audio every *stride* seconds.
+SYS_STRIDE_SECONDS = float(os.environ.get("SYS_STRIDE_SECONDS", "1.0"))  # update frequency
+SYS_WINDOW_SECONDS = float(os.environ.get("SYS_WINDOW_SECONDS", "3.0"))  # context for accuracy
+
+# Ollama
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.1:8b")
 
-WHISPER_SR = 16000
-CHUNK_SECONDS = float(os.environ.get("CHUNK_SECONDS", "2.0"))
-
-# Force device index if you want (ex: 15 from your dump)
+# Optional: pin a system audio device by index from sd.query_devices()
 FORCED_SYSTEM_AUDIO_DEVICE = os.environ.get("SYSTEM_AUDIO_DEVICE_INDEX")
 FORCED_SYSTEM_AUDIO_DEVICE = int(FORCED_SYSTEM_AUDIO_DEVICE) if FORCED_SYSTEM_AUDIO_DEVICE else None
 
-# ------------------ Helpers ------------------ #
+
+# -------------------------------------------------
+# Paths / static web
+# -------------------------------------------------
+
 def resource_dir(relative: str) -> Path:
     base = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
     return base / relative
 
+
 WEB_DIR = resource_dir("web")
 WEB_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="Watch & See Local App (Mic + System Audio)")
 
+app = FastAPI(title="Watch & See Local Agent (Mic + System Audio)")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -55,23 +78,40 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Serve UI
 app.mount("/web", StaticFiles(directory=str(WEB_DIR)), name="web")
+
 
 @app.get("/")
 def root():
     return FileResponse(str(WEB_DIR / "index.html"))
 
+
 @app.get("/app.js")
 def app_js():
     return FileResponse(str(WEB_DIR / "app.js"))
+
 
 @app.get("/style.css")
 def style_css():
     return FileResponse(str(WEB_DIR / "style.css"))
 
-# Load whisper once
-whisper = WhisperModel(WHISPER_MODEL, device=DEVICE, compute_type=COMPUTE_TYPE)
+
+@app.get("/manifest.webmanifest")
+def manifest():
+    return FileResponse(str(WEB_DIR / "manifest.webmanifest"))
+
+
+@app.get("/sw.js")
+def sw():
+    return FileResponse(str(WEB_DIR / "sw.js"))
+
+
+# -------------------------------------------------
+# Models
+# -------------------------------------------------
+
+whisper = WhisperModel(WHISPER_MODEL, device=WHISPER_DEVICE, compute_type=WHISPER_COMPUTE)
+
 
 def ollama_ok() -> bool:
     try:
@@ -80,47 +120,130 @@ def ollama_ok() -> bool:
     except Exception:
         return False
 
+
 def resample_linear(x: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:
     """Simple linear resampler (no extra deps)."""
     if src_sr == dst_sr:
         return x.astype(np.float32, copy=False)
     if x.size == 0:
         return x.astype(np.float32)
+
     duration = x.shape[0] / float(src_sr)
     dst_len = int(duration * dst_sr)
     if dst_len <= 1:
         return x[:1].astype(np.float32)
+
     src_t = np.linspace(0.0, duration, num=x.shape[0], endpoint=False)
     dst_t = np.linspace(0.0, duration, num=dst_len, endpoint=False)
     return np.interp(dst_t, src_t, x).astype(np.float32)
 
+
+def merge_transcript(prev: str, new: str) -> str:
+    """Best-effort de-dup when we transcribe overlapping windows."""
+    prev = (prev or "").strip()
+    new = (new or "").strip()
+    if not new:
+        return prev
+    if not prev:
+        return new
+
+    if new.startswith(prev):
+        return new
+    if prev.endswith(new):
+        return prev
+
+    max_k = min(len(prev), len(new), 120)
+    overlap = 0
+    for k in range(1, max_k + 1):
+        if prev[-k:] == new[:k]:
+            overlap = k
+    if overlap > 0:
+        return (prev + new[overlap:]).strip()
+
+    return (prev + " " + new).strip()
+
+
+# -------------------------------------------------
+# Audio device helpers
+# -------------------------------------------------
+
 def list_audio_devices() -> List[Dict[str, Any]]:
     devices = sd.query_devices()
     out: List[Dict[str, Any]] = []
-    for i, d in enumerate(devices):
-        hostapi_name = ""
+    for idx, d in enumerate(devices):
         try:
-            hostapi_name = sd.query_hostapis(d["hostapi"])["name"]
+            ha = sd.query_hostapis(d["hostapi"])["name"]
         except Exception:
-            pass
-        out.append({
-            "index": i,
-            "name": str(d.get("name", "")),
-            "hostapi": hostapi_name,
-            "max_input_channels": int(d.get("max_input_channels") or 0),
-            "max_output_channels": int(d.get("max_output_channels") or 0),
-            "default_samplerate": float(d.get("default_samplerate") or 0.0),
-        })
+            ha = "?"
+        out.append(
+            {
+                "index": idx,
+                "name": str(d.get("name", "")),
+                "hostapi": ha,
+                "max_input_channels": int(d.get("max_input_channels", 0)),
+                "max_output_channels": int(d.get("max_output_channels", 0)),
+                "default_samplerate": float(d.get("default_samplerate", 0) or 0),
+            }
+        )
     return out
 
-# ------------------ System Audio Capture ------------------ #
+
+def is_hostapi(d: Dict[str, Any], contains: str) -> bool:
+    try:
+        return contains.lower() in sd.query_hostapis(d["hostapi"])["name"].lower()
+    except Exception:
+        return False
+
+
+def pick_system_audio_device(forced_index: Optional[int]) -> int:
+    devices = sd.query_devices()
+
+    if forced_index is not None:
+        d = devices[forced_index]
+        if is_hostapi(d, "WDM-KS"):
+            raise RuntimeError(
+                "Selected device uses WDM-KS and often fails. Pick Stereo Mix on WASAPI/DirectSound/MME instead."
+            )
+        return int(forced_index)
+
+    # Prefer WASAPI Stereo Mix
+    for idx, d in enumerate(devices):
+        name = str(d.get("name", "")).lower()
+        if "stereo mix" in name and d.get("max_input_channels", 0) > 0 and is_hostapi(d, "WASAPI"):
+            return idx
+
+    # Then DirectSound Stereo Mix
+    for idx, d in enumerate(devices):
+        name = str(d.get("name", "")).lower()
+        if "stereo mix" in name and d.get("max_input_channels", 0) > 0 and is_hostapi(d, "DirectSound"):
+            return idx
+
+    # Then MME Stereo Mix
+    for idx, d in enumerate(devices):
+        name = str(d.get("name", "")).lower()
+        if "stereo mix" in name and d.get("max_input_channels", 0) > 0 and is_hostapi(d, "MME"):
+            return idx
+
+    # Fallback: WASAPI loopback devices
+    for idx, d in enumerate(devices):
+        name = str(d.get("name", "")).lower()
+        if "loopback" in name and d.get("max_input_channels", 0) > 0 and is_hostapi(d, "WASAPI"):
+            return idx
+
+    raise RuntimeError(
+        "No system-audio capture device found.\n"
+        "Fix: enable Stereo Mix in Windows:\n"
+        "  Control Panel → Sound → Recording → right click → Show Disabled Devices → Enable Stereo Mix\n"
+        "Then restart this app."
+    )
+
+
+# -------------------------------------------------
+# System audio manager
+# -------------------------------------------------
+
 class SystemAudioManager:
-    """
-    Captures system audio primarily via Stereo Mix.
-    - Avoids WDM-KS (often crashes with -9999).
-    - Uses device default sample rate (fixes -9997 invalid sample rate).
-    - Provides RMS debug so we can tell if audio is flowing.
-    """
+    """Captures system output (Stereo Mix / loopback), transcribes continuously."""
 
     def __init__(self):
         self.running: bool = False
@@ -133,63 +256,79 @@ class SystemAudioManager:
 
         self.buffer: Deque[np.ndarray] = deque()
         self.buffer_samples: int = 0
-
         self.stream: Optional[sd.InputStream] = None
 
-        # debug / info
         self.device_index: Optional[int] = None
         self.device_name: Optional[str] = None
         self.device_hostapi: Optional[str] = None
         self.capture_sr: Optional[int] = None
-        self.rms: float = 0.0  # audio level debug
+        self.channels: Optional[int] = None
 
-    def _hostapi_name(self, d: Dict[str, Any]) -> str:
+        self.forced_index: Optional[int] = FORCED_SYSTEM_AUDIO_DEVICE
+
+    def set_device_index(self, idx: Optional[int]):
+        with self.lock:
+            self.forced_index = idx
+
+    def _append_audio(self, indata: np.ndarray):
+        if indata.ndim == 2 and indata.shape[1] > 1:
+            mono = np.mean(indata, axis=1).astype(np.float32)
+        else:
+            mono = indata.reshape(-1).astype(np.float32)
+        self.buffer.append(mono)
+        self.buffer_samples += mono.shape[0]
+
+        # Keep last ~60s so memory doesn't grow forever
+        max_samples = int((self.capture_sr or 48000) * 60)
+        while self.buffer_samples > max_samples and self.buffer:
+            a = self.buffer.popleft()
+            self.buffer_samples -= a.shape[0]
+
+    def _get_last_n_samples(self, n_samples: int) -> Optional[np.ndarray]:
+        if self.buffer_samples < n_samples:
+            return None
+        parts = []
+        remaining = n_samples
+        for a in reversed(self.buffer):
+            if remaining <= 0:
+                break
+            take = min(a.shape[0], remaining)
+            parts.append(a[-take:])
+            remaining -= take
+        if remaining > 0:
+            return None
+        return np.concatenate(list(reversed(parts)))
+
+    @staticmethod
+    def _write_wav(pcm_int16: np.ndarray, sr: int) -> str:
+        fd, path = tempfile.mkstemp(suffix=".wav")
+        os.close(fd)
+        with wave.open(path, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(sr)
+            wf.writeframes(pcm_int16.tobytes())
+        return path
+
+    def _transcribe_float(self, pcm_float: np.ndarray, src_sr: int) -> str:
+        pcm_16k = resample_linear(pcm_float, src_sr=src_sr, dst_sr=WHISPER_SR)
+        pcm_int16 = np.clip(pcm_16k * 32767.0, -32768, 32767).astype(np.int16)
+        wav_path = self._write_wav(pcm_int16, WHISPER_SR)
         try:
-            return str(sd.query_hostapis(d["hostapi"])["name"])
-        except Exception:
-            return ""
-
-    def _set_selected(self, idx: int, d: Dict[str, Any]) -> int:
-        self.device_index = idx
-        self.device_name = str(d.get("name", ""))
-        self.device_hostapi = self._hostapi_name(d)
-        try:
-            self.capture_sr = int(d.get("default_samplerate") or 48000)
-        except Exception:
-            self.capture_sr = 48000
-        return idx
-
-    def _is_hostapi(self, d: Dict[str, Any], contains: str) -> bool:
-        return contains.lower() in self._hostapi_name(d).lower()
-
-    def _is_wdmks(self, d: Dict[str, Any]) -> bool:
-        return self._is_hostapi(d, "WDM-KS")
-
-    def _get_system_audio_device(self) -> int:
-        devices = sd.query_devices()
-
-        # If user forced a device index, use it (but reject WDM-KS)
-        if FORCED_SYSTEM_AUDIO_DEVICE is not None:
-            d = devices[FORCED_SYSTEM_AUDIO_DEVICE]
-            if self._is_wdmks(d):
-                raise RuntimeError("Forced device is WDM-KS (unstable). Pick WASAPI/MME/DirectSound instead.")
-            return self._set_selected(FORCED_SYSTEM_AUDIO_DEVICE, d)
-
-        # Prefer Stereo Mix: WASAPI -> DirectSound -> MME
-        # (avoid WDM-KS due to -9999 / driver ioctl errors)
-        priorities = ["WASAPI", "DirectSound", "MME"]
-        for backend in priorities:
-            for idx, d in enumerate(devices):
-                name = str(d.get("name", "")).lower()
-                if "stereo mix" in name and int(d.get("max_input_channels") or 0) > 0:
-                    if self._is_hostapi(d, backend) and not self._is_wdmks(d):
-                        return self._set_selected(idx, d)
-
-        raise RuntimeError(
-            "No usable Stereo Mix found (WASAPI/DirectSound/MME).\n"
-            "Fix: Control Panel → Sound → Recording → right click → Show Disabled Devices → Enable Stereo Mix.\n"
-            "Also ensure your output device is set correctly (Speakers/Headphones)."
-        )
+            segments, _info = whisper.transcribe(
+                wav_path,
+                vad_filter=True,
+                beam_size=WHISPER_BEAM,
+                best_of=WHISPER_BEST_OF,
+                temperature=0.0,
+                condition_on_previous_text=False,
+            )
+            return " ".join([s.text.strip() for s in segments if s.text]).strip()
+        finally:
+            try:
+                os.remove(wav_path)
+            except Exception:
+                pass
 
     def start(self):
         with self.lock:
@@ -201,7 +340,6 @@ class SystemAudioManager:
             self.error = None
             self.buffer.clear()
             self.buffer_samples = 0
-            self.rms = 0.0
 
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
@@ -209,6 +347,7 @@ class SystemAudioManager:
     def stop(self):
         with self.lock:
             self.running = False
+
         try:
             if self.stream is not None:
                 self.stream.stop()
@@ -228,94 +367,35 @@ class SystemAudioManager:
                 "device_name": self.device_name,
                 "device_hostapi": self.device_hostapi,
                 "capture_sr": self.capture_sr,
-                "whisper_sr": WHISPER_SR,
-                "rms": float(self.rms),
+                "channels": self.channels,
+                "forced_index": self.forced_index,
+                "sys_stride_seconds": SYS_STRIDE_SECONDS,
+                "sys_window_seconds": SYS_WINDOW_SECONDS,
             }
 
     def latest(self) -> Dict[str, Any]:
         with self.lock:
-            return {
-                "text": self.latest_text,
-                "ts": self.latest_ts,
-                "error": self.error,
-                "rms": float(self.rms),
-            }
-
-    def _append_audio(self, indata: np.ndarray):
-        # Convert to mono float32
-        if indata.ndim == 2 and indata.shape[1] > 1:
-            mono = np.mean(indata, axis=1).astype(np.float32)
-        else:
-            mono = indata.reshape(-1).astype(np.float32)
-
-        # audio level debug (RMS)
-        if mono.size:
-            self.rms = float(np.sqrt(np.mean(mono * mono)))
-        else:
-            self.rms = 0.0
-
-        self.buffer.append(mono)
-        self.buffer_samples += mono.shape[0]
-
-    def _pop_chunk(self, n_samples: int) -> Optional[np.ndarray]:
-        if self.buffer_samples < n_samples:
-            return None
-        parts = []
-        remaining = n_samples
-        while remaining > 0 and self.buffer:
-            a = self.buffer[0]
-            if a.shape[0] <= remaining:
-                parts.append(a)
-                remaining -= a.shape[0]
-                self.buffer.popleft()
-            else:
-                parts.append(a[:remaining])
-                self.buffer[0] = a[remaining:]
-                remaining = 0
-        self.buffer_samples -= n_samples
-        return np.concatenate(parts) if parts else None
-
-    @staticmethod
-    def _write_wav(pcm_int16: np.ndarray, sr: int) -> str:
-        fd, path = tempfile.mkstemp(suffix=".wav")
-        os.close(fd)
-        with wave.open(path, "wb") as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)
-            wf.setframerate(sr)
-            wf.writeframes(pcm_int16.tobytes())
-        return path
-
-    def _transcribe_pcm(self, pcm_float: np.ndarray, src_sr: int) -> str:
-        pcm_16k = resample_linear(pcm_float, src_sr=src_sr, dst_sr=WHISPER_SR)
-        pcm_int16 = np.clip(pcm_16k * 32767.0, -32768, 32767).astype(np.int16)
-        wav_path = self._write_wav(pcm_int16, WHISPER_SR)
-        try:
-            segments, _info = whisper.transcribe(wav_path, vad_filter=True, beam_size=1)
-            return " ".join([s.text.strip() for s in segments if s.text]).strip()
-        finally:
-            try:
-                os.remove(wav_path)
-            except Exception:
-                pass
+            return {"text": self.latest_text, "ts": self.latest_ts, "error": self.error}
 
     def _run(self):
         try:
-            device_index = self._get_system_audio_device()
-            d = sd.query_devices(device_index)
-
-            # IMPORTANT: use device default samplerate (avoids -9997)
+            idx = pick_system_audio_device(self.forced_index)
+            d = sd.query_devices(idx)
             capture_sr = int(d.get("default_samplerate") or 48000)
-
-            # Force mono for stability (Stereo Mix often weird in stereo)
-            channels = 1
+            channels = max(1, min(2, int(d.get("max_input_channels") or 1)))
 
             with self.lock:
+                self.device_index = int(idx)
+                self.device_name = str(d.get("name", ""))
+                try:
+                    self.device_hostapi = sd.query_hostapis(d["hostapi"])["name"]
+                except Exception:
+                    self.device_hostapi = None
                 self.capture_sr = capture_sr
+                self.channels = channels
 
             def callback(indata, frames, t, status):
                 if status:
-                    # keep running, but could log if desired
                     pass
                 with self.lock:
                     if not self.running:
@@ -327,29 +407,32 @@ class SystemAudioManager:
                 channels=channels,
                 dtype="float32",
                 callback=callback,
-                device=device_index,
+                device=idx,
                 blocksize=0,
             )
             self.stream.start()
 
-            n_samples = int(capture_sr * CHUNK_SECONDS)
+            window_samples = int(capture_sr * max(0.5, SYS_WINDOW_SECONDS))
+            stride_sleep = max(0.2, SYS_STRIDE_SECONDS)
+            last_tick = 0.0
 
             while True:
                 with self.lock:
                     if not self.running:
                         break
 
-                chunk = self._pop_chunk(n_samples)
-                if chunk is None:
-                    time.sleep(0.1)
+                now = time.time()
+                if (now - last_tick) < stride_sleep:
+                    time.sleep(0.05)
                     continue
+                last_tick = now
 
-                # If audio is basically silent, skip to avoid useless transcribes
-                if float(self.rms) < 0.0008:
+                chunk = self._get_last_n_samples(window_samples)
+                if chunk is None:
                     continue
 
                 try:
-                    text = self._transcribe_pcm(chunk, src_sr=capture_sr)
+                    text = self._transcribe_float(chunk, src_sr=capture_sr)
                 except Exception as e:
                     with self.lock:
                         self.error = f"Transcribe error: {e}"
@@ -357,7 +440,7 @@ class SystemAudioManager:
 
                 if text:
                     with self.lock:
-                        self.latest_text = (self.latest_text + " " + text).strip()
+                        self.latest_text = merge_transcript(self.latest_text, text)
                         self.latest_ts = time.time()
 
         except Exception as e:
@@ -375,47 +458,77 @@ class SystemAudioManager:
             with self.lock:
                 self.running = False
 
+
 system_audio = SystemAudioManager()
 
-# ------------------ API ------------------ #
+
+# -------------------------------------------------
+# API
+# -------------------------------------------------
+
 @app.get("/api/health")
 def health():
     return {
         "ok": True,
         "whisper_model": WHISPER_MODEL,
-        "device": DEVICE,
-        "compute_type": COMPUTE_TYPE,
+        "whisper_device": WHISPER_DEVICE,
+        "whisper_compute": WHISPER_COMPUTE,
+        "whisper_beam": WHISPER_BEAM,
+        "whisper_best_of": WHISPER_BEST_OF,
+        "sys_stride_seconds": SYS_STRIDE_SECONDS,
+        "sys_window_seconds": SYS_WINDOW_SECONDS,
         "ollama_ok": ollama_ok(),
         "ollama_model": OLLAMA_MODEL,
         "system_audio": system_audio.status(),
         "time": time.time(),
     }
 
-@app.get("/api/system_audio/devices")
-def system_audio_devices():
+
+@app.get("/api/audio_devices")
+def audio_devices():
     return {"devices": list_audio_devices()}
+
+
+class SelectDeviceReq(BaseModel):
+    index: Optional[int] = None
+
+
+@app.post("/api/system_audio/select")
+def system_audio_select(req: SelectDeviceReq):
+    was_running = system_audio.status().get("running", False)
+    if was_running:
+        system_audio.stop()
+        time.sleep(0.15)
+    system_audio.set_device_index(req.index)
+    if was_running:
+        system_audio.start()
+    return system_audio.status()
+
 
 @app.post("/api/system_audio/start")
 def system_audio_start():
     system_audio.start()
     return system_audio.status()
 
+
 @app.post("/api/system_audio/stop")
 def system_audio_stop():
     system_audio.stop()
     return system_audio.status()
 
+
 @app.get("/api/system_audio/status")
 def system_audio_status():
     return system_audio.status()
+
 
 @app.get("/api/system_audio/latest")
 def system_audio_latest():
     return system_audio.latest()
 
+
 @app.post("/api/transcribe")
 async def transcribe(audio: UploadFile = File(...)):
-    """Mic chunk transcription (webm from browser)."""
     data = await audio.read()
     if not data:
         return {"text": ""}
@@ -426,7 +539,14 @@ async def transcribe(audio: UploadFile = File(...)):
         tmp_path = tmp.name
 
     try:
-        segments, info = whisper.transcribe(tmp_path, vad_filter=True)
+        segments, info = whisper.transcribe(
+            tmp_path,
+            vad_filter=True,
+            beam_size=WHISPER_BEAM,
+            best_of=WHISPER_BEST_OF,
+            temperature=0.0,
+            condition_on_previous_text=False,
+        )
         text = " ".join([s.text.strip() for s in segments if s.text]).strip()
         return {"text": text, "language": getattr(info, "language", None)}
     finally:
@@ -435,8 +555,10 @@ async def transcribe(audio: UploadFile = File(...)):
         except Exception:
             pass
 
+
 class CoachReq(BaseModel):
     transcript: str
+
 
 def rule_coach(text: str) -> Dict[str, Any]:
     t = (text or "").lower()
@@ -475,9 +597,10 @@ def rule_coach(text: str) -> Dict[str, Any]:
     }
     return {"tips": tips, "scorecard": scorecard, "source": "rules"}
 
+
 def call_ollama(transcript: str) -> Optional[Dict[str, Any]]:
     prompt = f"""
-You are a real-time call coach (Observe-style). Based ONLY on the transcript snippet, give actionable tips.
+You are a real-time call coach. Based ONLY on the transcript snippet, give actionable tips.
 
 Transcript snippet:
 {transcript}
@@ -493,6 +616,7 @@ Return STRICT JSON only with:
   }}
 }}
 """
+
     payload = {
         "model": OLLAMA_MODEL,
         "prompt": prompt,
@@ -504,18 +628,19 @@ Return STRICT JSON only with:
         r = requests.post(f"{OLLAMA_URL}/api/generate", json=payload, timeout=12)
         r.raise_for_status()
         data = r.json()
-        raw = data.get("response", "").strip()
+        raw = (data.get("response") or "").strip()
         start = raw.find("{")
         end = raw.rfind("}")
         if start == -1 or end == -1:
             return None
-        obj = json.loads(raw[start:end + 1])
+        obj = json.loads(raw[start : end + 1])
         if "tips" not in obj:
             return None
         obj["source"] = "ollama"
         return obj
     except Exception:
         return None
+
 
 @app.post("/api/coach")
 def coach(req: CoachReq):
@@ -530,6 +655,8 @@ def coach(req: CoachReq):
 
     return rule_coach(snippet[-1200:])
 
+
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(app, host=APP_HOST, port=APP_PORT)
