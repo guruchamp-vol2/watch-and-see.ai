@@ -4,3 +4,5 @@ python-multipart==0.0.22
 faster-whisper==1.2.1
 pydantic==2.12.5
 requests==2.32.3
+sounddevice==0.5.1
+numpy==2.4.2

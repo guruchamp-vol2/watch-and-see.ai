@@ -1,5 +1,3 @@
-// Local App version served from http://127.0.0.1:8000/
-// Same-origin API base:
 const BASE = window.location.origin;
 
 const elMode = document.getElementById("mode");
@@ -20,11 +18,12 @@ const sCompliance = document.getElementById("sCompliance");
 let running = false;
 let transcriptText = "";
 let tipTimer = null;
+let systemPollTimer = null;
 
 // Browser SpeechRecognition
 let recognition = null;
 
-// Local mode recording
+// Mic whisper recording
 let mediaStream = null;
 let recorder = null;
 let chunkTimer = null;
@@ -58,6 +57,7 @@ function setScorecard(sc = {}) {
 function ruleCoach(text) {
   const t = (text || "").toLowerCase();
   const tips = [];
+
   const empathyPhrases = ["i understand", "that makes sense", "sorry", "i can imagine", "i hear you"];
   const hasEmpathy = empathyPhrases.some(p => t.includes(p));
   if (!hasEmpathy && text.length > 120) tips.push("Add empathy: try “I understand” or “That makes sense.”");
@@ -117,7 +117,8 @@ async function agentCoach(text) {
   }
 }
 
-async function sendAudioChunk(blob) {
+// ---- Mic chunk transcription ----
+async function sendMicChunk(blob) {
   if (pendingChunk) return;
   pendingChunk = true;
 
@@ -131,7 +132,7 @@ async function sendAudioChunk(blob) {
     const j = await r.json();
     if (j.text) addTranscript(j.text);
   } catch {
-    setStatus("Local transcription failed (check terminal).");
+    setStatus("Mic transcription failed (check terminal).");
   } finally {
     pendingChunk = false;
   }
@@ -168,7 +169,7 @@ function startBrowserSpeech() {
   recognition.start();
 }
 
-async function startLocalWhisper() {
+async function startMicWhisper() {
   setStatus("Requesting microphone...");
   mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
 
@@ -176,7 +177,7 @@ async function startLocalWhisper() {
   const chunks = [];
 
   recorder.ondataavailable = (e) => { if (e.data && e.data.size > 0) chunks.push(e.data); };
-  recorder.onstart = () => setStatus("Listening (Local Whisper)...");
+  recorder.onstart = () => setStatus("Listening (Mic Whisper)...");
   recorder.onstop = async () => {
     if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
     setStatus("Stopped.");
@@ -188,9 +189,42 @@ async function startLocalWhisper() {
     recorder.requestData();
     if (chunks.length > 0) {
       const blob = new Blob(chunks.splice(0, chunks.length), { type: "audio/webm" });
-      await sendAudioChunk(blob);
+      await sendMicChunk(blob);
     }
   }, 2000);
+}
+
+// ---- System audio mode ----
+async function startSystemAudio() {
+  setStatus("Starting System Audio (Windows loopback)...");
+  const r = await fetch(`${BASE}/api/system_audio/start`, { method: "POST" });
+  const j = await r.json();
+  if (j.error) {
+    setStatus(`System audio error: ${j.error}`);
+    throw new Error(j.error);
+  }
+  setStatus("Listening (System Audio)...");
+  // poll latest transcript
+  systemPollTimer = setInterval(async () => {
+    const rr = await fetch(`${BASE}/api/system_audio/latest`);
+    const jj = await rr.json();
+    if (jj.error) {
+      setStatus(`System audio error: ${jj.error}`);
+      return;
+    }
+    if (jj.text && jj.text.length > transcriptText.length) {
+      // naive: replace with latest full transcript
+      transcriptText = jj.text;
+      elTranscript.textContent = transcriptText;
+      elTranscript.scrollTop = elTranscript.scrollHeight;
+    }
+  }, 1000);
+}
+
+async function stopSystemAudio() {
+  try { await fetch(`${BASE}/api/system_audio/stop`, { method: "POST" }); } catch {}
+  if (systemPollTimer) clearInterval(systemPollTimer);
+  systemPollTimer = null;
 }
 
 async function startCoachLoop() {
@@ -198,15 +232,12 @@ async function startCoachLoop() {
     const recent = getRecentText(900);
     if (!recent || recent.trim().length < 20) return;
 
-    if (elMode.value === "local") {
-      const res = await agentCoach(recent);
-      if (res && res.tips) {
-        setTips(res.tips);
-        setScorecard(res.scorecard || {});
-        return;
-      }
+    const res = await agentCoach(recent);
+    if (res && res.tips) {
+      setTips(res.tips);
+      setScorecard(res.scorecard || {});
+      return;
     }
-
     const fallback = ruleCoach(recent);
     setTips(fallback.tips);
     setScorecard(fallback.scorecard);
@@ -222,6 +253,7 @@ function stopAll() {
   tipTimer = null;
 
   if (recognition) { try { recognition.onend = null; recognition.stop(); } catch {} recognition = null; }
+
   if (chunkTimer) clearInterval(chunkTimer);
   chunkTimer = null;
 
@@ -229,6 +261,9 @@ function stopAll() {
   recorder = null;
 
   if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
+
+  stopSystemAudio();
+
   setStatus("Stopped.");
 }
 
@@ -241,12 +276,19 @@ elStart.addEventListener("click", async () => {
 
   await startCoachLoop();
 
-  if (elMode.value === "browser") {
-    if (!supportsBrowserSpeech()) { setStatus("Browser Speech not supported."); return; }
-    startBrowserSpeech();
-  } else {
-    await agentHealth();
-    try { await startLocalWhisper(); } catch { stopAll(); }
+  try {
+    if (elMode.value === "browser") {
+      if (!supportsBrowserSpeech()) { setStatus("Browser Speech not supported."); return; }
+      startBrowserSpeech();
+    } else if (elMode.value === "local") {
+      await agentHealth();
+      await startMicWhisper();
+    } else if (elMode.value === "system") {
+      await agentHealth();
+      await startSystemAudio();
+    }
+  } catch (e) {
+    stopAll();
   }
 });
 
